@@ -13,6 +13,8 @@ authors = [{ name = "Clara" }]
 
 dependencies = [
     "pyomo>=6.7",
+    "scipy>=1.11",
+    "openpyxl>=3.1",
     "pandas>=2.0",
     "matplotlib>=3.8",
     "numpy>=1.26",
@@ -35,10 +37,18 @@ dev = [
 idaes = [
     "idaes-pse>=2.4",
 ]
+# Global LCOW map script (land mask + projection)
+maps = [
+    "cartopy>=0.22",
+    "shapely>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.data.salt_pricing" = ["*.xlsx"]
 
 [tool.ruff]
 line-length = 100

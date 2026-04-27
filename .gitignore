@@ -42,6 +42,9 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Local API / tool caches (can be large)
+.cache/
+
 # Data / outputs (large files)
 *.h5
 *.hdf5
