@@ -1,10 +1,10 @@
 # Default economic inputs for LCOW (see src/optimization/economics.LCOEconomicParams)
-f_wacc: 0.08
-L_years: 10
-f_toti: 1.0
-f_mlc: 0.05
-f_util: 0.9
-tau_hyd_years: 1.0
-C_energy_usd_per_year: 0.0
+discount_rate: 0.08
+device_lifetime_years: 10
+total_investment_factor: 1.0
+maintenance_cost_fraction: 0.05
+utilization_factor: 0.9
+hydrogel_lifetime_years: 1.0
+energy_cost_usd_per_year: 0.0
 c_acrylamide_usd_per_kg: 1.6
-# Optional: per-salt c_salt is in src/materials/salts.SALT_TABLE
+# Optional: per-salt prices are in src/materials/salts.SALT_TABLE

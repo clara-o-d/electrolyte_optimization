@@ -1,109 +1,149 @@
-# Sorbent AWH Optimization
+# Electrolyte Optimization for Sorbent Atmospheric Water Harvesting
 
-A Pyomo-based optimization framework for **electrolyte and hydrogel design** for sorbent-based **atmospheric water harvesting (AWH)** — anywhere in the world.
+This repo models and optimizes salt-hydrogel composites for **sorbent atmospheric water harvesting (SAWH)** — devices that passively absorb water vapor from humid air and release it as liquid water when heated. The goal is to find the salt blend and composite formulation that minimizes the **levelized cost of water (LCOW, $/kg)** at a given geographic site.
 
-## Overview
+## Background
 
-This package provides tools to:
+A SAWH device cycles between two humidity states each day:
 
-- **Optimize sorbent material formulations** (electrolytes, hydrogels) for AWH performance under real-world climate conditions
-- **Query global weather data** (relative humidity, solar irradiance, temperature) via the [Open-Meteo](https://open-meteo.com/) API
-- **Run Pyomo optimization models** for sorbent design, cost, and water yield
-- **Analyze sensitivity** of system performance to material and climate parameters
+- **High humidity (uptake):** the hydrogel composite absorbs water vapor from the air. The salt dissolved in the hydrogel lowers water activity, creating a driving force for vapor absorption.
+- **Low humidity (desorption):** the composite is heated (e.g., by sunlight), driving the water out as vapor, which condenses and is collected.
 
-## Repository Structure
+The amount of water produced per cycle depends on the **difference in water uptake** between the high- and low-humidity states. The four candidate salts — **LiCl, NaCl, CaCl2, MgCl2** — each have different vapor pressure isotherms and prices, so blending them can improve yield or reduce cost compared to any single salt.
+
+## What the optimization does
+
+For a site described by its mean daily high and low relative humidity, the optimizer finds:
+
+1. **Blend weights** `f_i` for each salt (fraction of the brine attributed to salt `i`, summing to 1)
+2. **Salt-to-polymer ratio** (mass of salt per mass of acrylamide polymer in the dry composite)
+
+...to minimize LCOW:
 
 ```
-electrolyte_optimization/
-├── src/
-│   ├── data/
-│   │   └── weather/        # Open-Meteo API client for global climate data
-│   ├── models/             # Pyomo optimization model definitions
-│   ├── optimization/       # Solvers, problem formulations, and workflows
-│   ├── materials/          # Electrolyte and hydrogel property databases
-│   ├── analysis/           # Post-processing, sensitivity analysis, visualization
-│   └── utils/              # Shared utilities (unit conversion, I/O, logging)
-├── tests/                  # Unit and integration tests
-├── notebooks/              # Jupyter notebooks for exploration and results
-├── docs/                   # Documentation
-└── configs/                # Configuration files (solver settings, material params)
+LCOW = annual_cost_USD / (utilization_factor × annual_water_yield_kg)
 ```
+
+The brine state at each humidity is computed using the **ZSR (Zdanovskii) isopiestic mixing rule**: at fixed humidity, each salt contributes molality in proportion to its blend weight and its binary reference molality (the molality of a pure salt solution at that humidity).
+
+## Repository structure
+
+```
+src/
+  materials/
+    salts.py              Salt records: formula weight, ion count, RH range, price
+    salt_prices.py        Loads bulk salt prices from salt_price_data.xlsx
+
+  optimization/
+    brine_equilibrium.py  Isotherm fits: equilibrium brine salt fraction at a given RH
+                          Also converts between mass fraction and molality
+    brine_uptake.py       Sorption factor physics: water mole fraction, uptake coefficient B
+    economics.py          LCOEconomicParams dataclass + device/material cost constants
+    climate.py            Aggregates hourly weather data to mean daily RH high/low
+    zsr_mixing.py         ZSR mixing rule, scalar LCOW function, optimizer entry point
+
+  models/
+    zsr_lcow_model.py     Pyomo NLP model (decision variables, constraints, objective)
+                          Also contains SiteClimate, HalfSwingCoefficients, and scalar helpers
+    salt_feasibility.py   Pre-filters candidate salts to those with a positive half-swing
+
+  data/
+    weather/              Open-Meteo weather client (fetches/caches hourly RH)
+    salt_pricing/         salt_price_data.xlsx
+
+configs/
+  default_lcow.yaml       Default economic parameters
+
+scripts/
+  run_lcow_opt.py         Optimize a single site (fetches weather, prints result)
+  lcow_random_global_map.py  Sample random land sites, optimize each, plot a world map
+
+tests/
+  test_zsr_mixing.py      Unit + integration tests for the ZSR model
+```
+
+## Key concepts
+
+**Equilibrium brine salt fraction** (`brine_equilibrium.py`): at a given relative humidity, a salt solution reaches thermodynamic equilibrium at a specific salt mass fraction. This is solved numerically from isotherm fits (polynomial and implicit forms, ported from MATLAB).
+
+**Uptake coefficient B** (`brine_uptake.py`): a dimensionless group that connects the brine composition to water uptake. Defined as:
+
+```
+B = (x_w × ions_per_formula / (1 − x_w)) × (water_MW / salt_MW)
+```
+
+where `x_w` is the water mole fraction in the brine (colligative basis). The half-cycle water yield per kg of composite is proportional to `(B_high − B_low)`.
+
+**ZSR mixing** (`zsr_mixing.py`): at fixed humidity, the mixture molality of salt `i` is `blend_weight_i × reference_molality_i`. Effective mixture properties (ion count, formula weight) are molality-weighted averages across salts.
+
+**Pyomo NLP** (`zsr_lcow_model.py`): the blend weights and salt-to-polymer ratio are continuous decision variables. Constraints enforce that weights sum to 1 and that the high-humidity uptake exceeds the low-humidity uptake (positive half-swing). The objective is LCOW.
+
+**Solvers**: Ipopt (interior-point NLP solver) is used when available. SciPy SLSQP is the fallback.
 
 ## Installation
 
 ```bash
-git clone https://github.com/<your-org>/electrolyte_optimization.git
-cd electrolyte_optimization
-pip install -e ".[dev]"
+pip install -e .
 ```
 
-> **Requirements:** Python ≥ 3.10, Pyomo, SciPy, pandas, requests. **Ipopt** (nonlinear solver) is required for the LCOW NLP; install via Conda (`conda install -c conda-forge ipopt`), Homebrew (`brew install ipopt`), or your platform package manager. Optional: IDAES-PSE bundles solvers in some environments.
-
-## Quick Start
-
-### Fetch weather data for a location
-
-```python
-from src.data.weather import WeatherClient
-
-client = WeatherClient()
-
-# By coordinates
-df = client.get_historical(latitude=28.6, longitude=77.2, start="2024-01-01", end="2024-12-31")
-
-# By place name (uses built-in geocoding)
-df = client.get_historical_by_name("Phoenix, AZ", start="2024-01-01", end="2024-12-31")
-
-print(df[["temperature_2m", "relative_humidity_2m", "shortwave_radiation"]].describe())
+For the global map script:
+```bash
+pip install -e ".[maps]"
 ```
 
-### Run LCOW optimization (salt + salt-to-polymer ratio)
-
-The model minimizes **levelized cost of water** ($/kg) over **salt** and **SL = m_s / m_p** in **one** unified Pyomo solve: NLP (Ipopt, or SciPy 1D if only one salt is feasible and Ipopt is missing) or MINLP (Bonmin and/or Couenne, each tried if installed) when several salts are thermodynamically feasible. If every ASL MINLP run fails or is non-optimal (e.g. “Solver (asl) did not exit normally”), the code uses **one bounded 1-D solve per feasible salt** and takes the minimum—the same nested minimum for this model. Economics use supplement-style BOM constants; sorption uses equilibrium **mf(RH)** ported from the project’s `calculate_mf_*.m` logic; default active layer is **1 mm** at **2000 kg/m³** (2 kg dry composite per m²).
-
-```python
-from src.models.lcow_sawh import SiteClimate
-from src.optimization.economics import LCOEconomicParams
-from src.optimization.solve import optimize_salt_and_sl
-
-# Representative diurnal RH (fractions 0–1): high for absorption, low for desorption.
-site = SiteClimate(rh_high=0.88, rh_low=0.78)
-econ = LCOEconomicParams(f_wacc=0.08, L_years=10, f_util=0.9)
-result = optimize_salt_and_sl(site, econ=econ)
-print(result.best_salt, result.best_sl, result.best_lcow)
+Ipopt can be installed via conda:
+```bash
+conda install -c conda-forge ipopt
 ```
 
-CLI example (fetches one year of hourly RH via Open-Meteo, then optimizes):
+## Usage
 
+**Optimize a single site:**
 ```bash
 python scripts/run_lcow_opt.py --lat 33.45 --lon -112.07 --year 2023
 ```
 
-### Random land sites → world map (LCOW)
-
-Install map dependencies, then sample random **land** locations (Natural Earth + Shapely), run the same optimization at each site, and save a PNG + CSV:
-
+**Run across random land sites and plot:**
 ```bash
-pip install -e ".[maps]"
-python scripts/lcow_random_global_map.py --n 24 --seed 0 --year 2023
+python scripts/lcow_random_global_map.py --n-sites 50 --year 2023
 ```
 
-Outputs default to `outputs/lcow_global/lcow_random_sites.png` and `.csv`. Use `--sleep` to pace Open-Meteo requests (seconds between sites).
+**Use the optimizer directly:**
+```python
+from src.models.zsr_lcow_model import SiteClimate
+from src.models.salt_feasibility import feasible_salts_for_site
+from src.optimization.economics import LCOEconomicParams
+from src.optimization.zsr_mixing import optimize_zsr_blend_and_sl
+from src.materials.salts import CANDIDATE_SALTS
 
-**Convention:** `LCOEconomicParams` keeps **one** utilization factor in the LCOW denominator: annual cost ÷ (`f_util` × gross annual water yield), with gross yield before `f_util` (see `src/optimization/economics.py`).
+site = SiteClimate(humidity_high=0.9, humidity_low=0.35, temperature_c=25.0)
+econ = LCOEconomicParams()
+names = feasible_salts_for_site(site, CANDIDATE_SALTS)
+result = optimize_zsr_blend_and_sl(site, names, econ)
 
-**Salt bulk cost:** Candidate-salt **$/kg** comes from [`src/data/salt_pricing/salt_price_data.xlsx`](src/data/salt_pricing/salt_price_data.xlsx) (`$/kg` column) when present; otherwise a small default (see `src/materials/salts.py`). Requires `openpyxl` (listed in project dependencies).
+print(f"LCOW: ${result.best_lcow:.4f}/kg water")
+print(f"Salt-to-polymer ratio: {result.best_sl:.3f}")
+for name, weight in zip(result.names, result.best_f):
+    if weight > 0.01:
+        print(f"  {name}: {weight:.3f}")
+```
 
-## Data Sources
+## Economic parameters
 
-| Variable | Source | Notes |
+All parameters are in `LCOEconomicParams` (see `src/optimization/economics.py`):
+
+| Parameter | Default | Meaning |
 |---|---|---|
-| Relative Humidity (%) | Open-Meteo Archive / Forecast | ERA5 reanalysis |
-| Temperature (°C) | Open-Meteo Archive / Forecast | ERA5 reanalysis |
-| Shortwave Radiation (W/m²) | Open-Meteo Archive / Forecast | Global horizontal |
-| Direct Normal Irradiance (W/m²) | Open-Meteo Archive / Forecast | DNI |
-| Diffuse Radiation (W/m²) | Open-Meteo Archive / Forecast | |
+| `discount_rate` | 0.08 | WACC / annual discount rate |
+| `device_lifetime_years` | 10 | Device economic lifetime |
+| `total_investment_factor` | 1.0 | Scales capital cost for indirect costs |
+| `maintenance_cost_fraction` | 0.05 | Annual maintenance as fraction of capital |
+| `utilization_factor` | 0.9 | Fraction of days the device operates |
+| `hydrogel_lifetime_years` | 1.0 | Hydrogel replacement interval |
+| `energy_cost_usd_per_year` | 0.0 | Auxiliary energy cost (e.g. pumping) |
 
-## License
+## Running tests
 
-MIT
+```bash
+pytest
+```

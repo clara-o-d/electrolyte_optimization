@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Sample random land locations, run LCOW optimization, plot results on a world map.
+"""Sample random land locations, run ZSR LCOW optimization, plot results on a world map.
 
 Requires optional deps:  pip install -e ".[maps]"
 
-By default each site uses **ZSR continuous salt mixture** optimization
-(:func:`optimize_zsr_blend_and_sl`: Pyomo + Ipopt when available). Pass ``--discrete`` to use
-the legacy discrete-salt path (:func:`optimize_salt_and_sl`).
+Each site uses ZSR continuous salt mixture optimization
+(:func:`optimize_zsr_blend_and_sl`: Pyomo + Ipopt when available, else SciPy SLSQP).
 
 Uses Natural Earth (via Cartopy) for coastlines/land and Shapely for land-only point
 sampling. Open-Meteo is queried once per point (see ``--sleep`` for polite pacing).
@@ -31,13 +30,12 @@ if str(_REPO) not in sys.path:
 
 from src.data.weather import WeatherClient
 from src.materials.salts import CANDIDATE_SALTS
-from src.models.lcow_sawh import SiteClimate
-from src.models.salt_unified_model import feasible_salts_for_site
+from src.models.zsr_lcow_model import SiteClimate
+from src.models.salt_feasibility import feasible_salts_for_site
 from src.optimization.climate import site_row_from_hourly
 from src.materials.salt_prices import salt_price_data_path
 from src.optimization.economics import LCOEconomicParams
-from src.optimization.solve import ipopt_available, optimize_salt_and_sl
-from src.optimization.zsr_mixing import optimize_zsr_blend_and_sl
+from src.optimization.zsr_mixing import ipopt_available, optimize_zsr_blend_and_sl
 
 _FAIL_LCO: float = 1e30
 
@@ -58,16 +56,14 @@ class SiteResult:
     rh_high: float
     rh_low: float
     best_salt: str
-    """For ZSR maps, the **dominant** salt (largest blend fraction) so markers stay meaningful."""
+    """Dominant salt (largest blend fraction) so markers stay meaningful."""
     best_sl: float
     best_lcow: float
     infeasible: bool
-    optimize_mode: str = "zsr"
-    """``\"zsr\"`` = continuous mixture NLP; ``\"discrete\"`` = :func:`optimize_salt_and_sl`."""
     zsr_backend: str = ""
-    """``ipopt`` / ``scipy_slsqp`` when ``optimize_mode == \"zsr\"``."""
+    """``ipopt`` / ``scipy_slsqp``."""
     blend: str = ""
-    """Semicolon-separated ``Salt=weight`` for ZSR (empty for discrete)."""
+    """Semicolon-separated ``Salt=weight`` for ZSR."""
 
 
 def _try_import_map_stack():
@@ -142,7 +138,6 @@ def run_sites(
     year: int,
     sleep_s: float,
     cache_dir: Path | None,
-    discrete_salt: bool = False,
 ) -> list[SiteResult]:
     start = date(year, 1, 1)
     end = date(year, 12, 31)
@@ -166,65 +161,41 @@ def run_sites(
         )
         row = site_row_from_hourly(df)
         site = SiteClimate(
-            rh_high=row["rh_high_frac"],
-            rh_low=row["rh_low_frac"],
+            humidity_high=row["rh_high_frac"],
+            humidity_low=row["rh_low_frac"],
         )
         print(
-            f"  mean daily max RH={site.rh_high:.3f}  min RH={site.rh_low:.3f}  optimizing…",
+            f"  mean daily max RH={site.humidity_high:.3f}  min RH={site.humidity_low:.3f}  optimizing…",
             end="",
             flush=True,
         )
         err_msg = ""
-        out = None
         z_out = None
         try:
-            if discrete_salt:
-                out = optimize_salt_and_sl(site, econ=econ)
+            names = tuple(feasible_salts_for_site(site, CANDIDATE_SALTS))
+            if not names:
+                err_msg = "no feasible salts for site"
             else:
-                names = tuple(feasible_salts_for_site(site, CANDIDATE_SALTS))
-                if not names:
-                    err_msg = "no feasible salts for site"
-                else:
-                    z_out = optimize_zsr_blend_and_sl(site, names, econ)
-                    if not z_out.success or not math.isfinite(z_out.best_lcow):
-                        err_msg = (z_out.message or "ZSR failed")[:240]
-                        z_out = None
+                z_out = optimize_zsr_blend_and_sl(site, names, econ)
+                if not z_out.success or not math.isfinite(z_out.best_lcow):
+                    err_msg = (z_out.message or "ZSR failed")[:240]
+                    z_out = None
         except Exception as exc:
             err_msg = str(exc).split("\n", 1)[0][:240]
-            out = None
             z_out = None
 
-        if discrete_salt and out is None:
+        if z_out is None:
             print(f"  → skipped ({err_msg})  ({time.perf_counter() - t_site:.1f}s)", flush=True)
             results.append(
                 SiteResult(
                     lat=lat,
                     lon=lon,
-                    rh_high=site.rh_high,
-                    rh_low=site.rh_low,
+                    rh_high=site.humidity_high,
+                    rh_low=site.humidity_low,
                     best_salt="none",
                     best_sl=float("nan"),
                     best_lcow=_FAIL_LCO,
                     infeasible=True,
-                    optimize_mode="discrete",
-                )
-            )
-            if sleep_s > 0.0 and i < n:
-                time.sleep(sleep_s)
-            continue
-        if not discrete_salt and z_out is None:
-            print(f"  → skipped ({err_msg})  ({time.perf_counter() - t_site:.1f}s)", flush=True)
-            results.append(
-                SiteResult(
-                    lat=lat,
-                    lon=lon,
-                    rh_high=site.rh_high,
-                    rh_low=site.rh_low,
-                    best_salt="none",
-                    best_sl=float("nan"),
-                    best_lcow=_FAIL_LCO,
-                    infeasible=True,
-                    optimize_mode="zsr",
                 )
             )
             if sleep_s > 0.0 and i < n:
@@ -232,62 +203,37 @@ def run_sites(
             continue
 
         dt = time.perf_counter() - t_site
-        if discrete_salt and out is not None:
-            bad = not math.isfinite(out.best_lcow) or out.best_lcow >= 0.99 * _FAIL_LCO
-            results.append(
-                SiteResult(
-                    lat=lat,
-                    lon=lon,
-                    rh_high=site.rh_high,
-                    rh_low=site.rh_low,
-                    best_salt=out.best_salt,
-                    best_sl=float(out.best_sl) if out.best_sl == out.best_sl else float("nan"),
-                    best_lcow=float(out.best_lcow),
-                    infeasible=bad,
-                    optimize_mode="discrete",
-                )
+        bad = not math.isfinite(z_out.best_lcow) or z_out.best_lcow >= 0.99 * _FAIL_LCO
+        dom_i = int(np.argmax(z_out.best_f))
+        dom = z_out.names[dom_i]
+        blend = ";".join(
+            f"{nm}={float(w):.4f}"
+            for nm, w in zip(z_out.names, z_out.best_f, strict=True)
+            if float(w) >= 1e-4
+        )
+        results.append(
+            SiteResult(
+                lat=lat,
+                lon=lon,
+                rh_high=site.humidity_high,
+                rh_low=site.humidity_low,
+                best_salt=dom,
+                best_sl=float(z_out.best_sl),
+                best_lcow=float(z_out.best_lcow),
+                infeasible=bad,
+                zsr_backend=z_out.backend,
+                blend=blend,
             )
-            if bad:
-                print(f"  → infeasible / placeholder LCOW  ({dt:.1f}s)", flush=True)
-            else:
-                print(
-                    f"  → discrete {out.best_salt}  SL={out.best_sl:.4f}  "
-                    f"LCOW=${out.best_lcow:.6f}/kg  ({dt:.1f}s)",
-                    flush=True,
-                )
-        elif z_out is not None:
-            bad = not math.isfinite(z_out.best_lcow) or z_out.best_lcow >= 0.99 * _FAIL_LCO
-            dom_i = int(np.argmax(z_out.best_f))
-            dom = z_out.names[dom_i]
-            blend = ";".join(
-                f"{nm}={float(w):.4f}"
-                for nm, w in zip(z_out.names, z_out.best_f, strict=True)
-                if float(w) >= 1e-4
+        )
+        if bad:
+            print(f"  → infeasible / placeholder LCOW  ({dt:.1f}s)", flush=True)
+        else:
+            short = blend if len(blend) <= 56 else blend[:53] + "…"
+            print(
+                f"  → ZSR[{z_out.backend}]  dom={dom}  SL={z_out.best_sl:.4f}  "
+                f"LCOW=${z_out.best_lcow:.6f}/kg  [{short}]  ({dt:.1f}s)",
+                flush=True,
             )
-            results.append(
-                SiteResult(
-                    lat=lat,
-                    lon=lon,
-                    rh_high=site.rh_high,
-                    rh_low=site.rh_low,
-                    best_salt=dom,
-                    best_sl=float(z_out.best_sl),
-                    best_lcow=float(z_out.best_lcow),
-                    infeasible=bad,
-                    optimize_mode="zsr",
-                    zsr_backend=z_out.backend,
-                    blend=blend,
-                )
-            )
-            if bad:
-                print(f"  → infeasible / placeholder LCOW  ({dt:.1f}s)", flush=True)
-            else:
-                short = blend if len(blend) <= 56 else blend[:53] + "…"
-                print(
-                    f"  → ZSR[{z_out.backend}]  dom={dom}  SL={z_out.best_sl:.4f}  "
-                    f"LCOW=${z_out.best_lcow:.6f}/kg  [{short}]  ({dt:.1f}s)",
-                    flush=True,
-                )
         if sleep_s > 0.0 and i < n:
             time.sleep(sleep_s)
     print(f"  All sites done in {time.perf_counter() - t_batch:.1f}s (avg {((time.perf_counter() - t_batch) / max(n,1)):.1f}s / site, incl. sleep).", flush=True)
@@ -408,11 +354,6 @@ def main() -> int:
         default=_REPO / "outputs" / "lcow_global" / "lcow_random_sites.csv",
     )
     p.add_argument("--cache", type=Path, default=_REPO / ".cache" / "openmeteo")
-    p.add_argument(
-        "--discrete",
-        action="store_true",
-        help="Use discrete salt choice (optimize_salt_and_sl / MINLP path) instead of default ZSR mixture NLP.",
-    )
     args = p.parse_args()
     print("=== lcow_random_global_map.py ===", flush=True)
     print(
@@ -422,17 +363,10 @@ def main() -> int:
     )
     xlsx = salt_price_data_path()
     print(f"  Salt $/kg: {xlsx.name}  (exists={xlsx.is_file()})", flush=True)
-    if args.discrete:
-        print(
-            f"  Optimize: **discrete** (unified Pyomo); Ipopt={ipopt_available()}  "
-            f"(multi-feasible sites may need Bonmin/Couenne or scipy enum fallback).",
-            flush=True,
-        )
-    else:
-        print(
-            f"  Optimize: **ZSR mixture** (Pyomo+Ipopt if available, else SciPy); Ipopt={ipopt_available()}",
-            flush=True,
-        )
+    print(
+        f"  Optimize: ZSR mixture (Pyomo+Ipopt if available, else SciPy); Ipopt={ipopt_available()}",
+        flush=True,
+    )
     t_main = time.perf_counter()
     try:
         _try_import_map_stack()
@@ -452,9 +386,7 @@ def main() -> int:
         year=args.year,
         sleep_s=args.sleep,
         cache_dir=args.cache,
-        discrete_salt=args.discrete,
     )
-    # Summary
     feas = [r for r in res if r.infeasible is False]
     n_bad = len(res) - len(feas)
     lcs = [r.best_lcow for r in feas if math.isfinite(r.best_lcow) and r.best_lcow < 0.99 * _FAIL_LCO]
@@ -473,12 +405,11 @@ def main() -> int:
     df.to_csv(args.out_csv, index=False)
     print(f"Wrote {args.out_csv}", flush=True)
     print("--- Step 4: render map (Natural Earth + scatter) ---", flush=True)
-    mode_tag = "ZSR blend" if not args.discrete else "discrete salt"
     plot_map(
         res,
         args.out_png,
         title=(
-            f"SAWH LCOW min ($/kg), {mode_tag}, random land sites, {args.year} "
+            f"SAWH LCOW min ($/kg), ZSR blend, random land sites, {args.year} "
             f"(mean diurnal RH extrema)"
         ),
     )

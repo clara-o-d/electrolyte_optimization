@@ -9,80 +9,79 @@ import pyomo.environ as pe
 import pytest
 from pyomo.opt import SolverFactory
 
-from src.models.lcow_zsr_pyomo import build_lcow_zsr_pyomo_model
-from src.models.lcow_sawh import SiteClimate, lcow_at_sl, uptake_B_coefficients
-from src.models.salt_unified_model import feasible_salts_for_site
-from src.materials.salts import CANDIDATE_SALTS
+from src.models.zsr_lcow_model import (
+    SiteClimate,
+    build_lcow_model,
+    single_salt_lcow_at_loading,
+    single_salt_half_swing_coefficients,
+)
+from src.models.salt_feasibility import feasible_salts_for_site
+from src.materials.salts import CANDIDATE_SALTS, get_salt
 from src.optimization.economics import LCOEconomicParams
-from src.optimization.mf_equilibrium import equilibrate_salt_mf
-from src.optimization.zsr_mixing import (
+from src.optimization.brine_equilibrium import (
     binary_molality_at_rh,
+    equilibrate_salt_mf,
+    salt_fraction_to_molality,
+    molality_to_salt_fraction,
+)
+from src.optimization.zsr_mixing import (
     lcow_zsr_at_sl,
-    mf_to_molality_kg_mol,
-    molality_to_mf,
     optimize_zsr_blend_and_sl,
     uptake_B_zsr,
 )
-from src.materials.salts import get_salt
 
 
-def test_mf_molality_roundtrip() -> None:
-    mw = 58.44
-    for _mf in (0.05, 0.12, 0.3):
-        m = mf_to_molality_kg_mol(_mf, mw)
-        mf2 = molality_to_mf(m, mw)
-        assert abs(mf2 - _mf) < 1e-9 * max(1.0, abs(_mf))
+def test_salt_fraction_molality_roundtrip() -> None:
+    formula_weight = 58.44
+    for fraction in (0.05, 0.12, 0.3):
+        molality = salt_fraction_to_molality(fraction, formula_weight)
+        fraction_back = molality_to_salt_fraction(molality, formula_weight)
+        assert abs(fraction_back - fraction) < 1e-9 * max(1.0, abs(fraction))
 
 
-def test_binary_molality_matches_mf() -> None:
+def test_binary_molality_matches_equilibrium() -> None:
     site = SiteClimate(0.88, 0.78)
     for name in ("NaCl", "LiCl"):
-        mf = equilibrate_salt_mf(name, site.rh_high, site.t_c)
-        m_code = binary_molality_at_rh(name, site.rh_high, site.t_c)
-        m_ref = mf_to_molality_kg_mol(mf, get_salt(name).mw)
-        assert abs(m_code - m_ref) < 1e-6 * max(1.0, abs(m_ref))
+        brine_fraction = equilibrate_salt_mf(name, site.humidity_high, site.temperature_c)
+        molality_from_helper = binary_molality_at_rh(name, site.humidity_high, site.temperature_c)
+        molality_from_fraction = salt_fraction_to_molality(brine_fraction, get_salt(name).mw)
+        assert abs(molality_from_helper - molality_from_fraction) < 1e-6 * max(1.0, abs(molality_from_fraction))
 
 
 def test_zsr_pure_salt_uptake_matches_single_salt() -> None:
     site = SiteClimate(0.9, 0.78)
     for name in ("NaCl", "LiCl"):
         vec = np.zeros(len(CANDIDATE_SALTS), dtype=np.float64)
-        idx = CANDIDATE_SALTS.index(name)
-        vec[idx] = 1.0
-        u_z = uptake_B_zsr(vec, CANDIDATE_SALTS, site)
-        u0 = uptake_B_coefficients(name, site)
-        assert u0 is not None and u_z is not None
-        assert abs(u_z.b_high - u0.b_high) < 1e-5 * max(1.0, abs(u0.b_high))
-        assert abs(u_z.b_low - u0.b_low) < 1e-5 * max(1.0, abs(u0.b_low))
+        vec[CANDIDATE_SALTS.index(name)] = 1.0
+        zsr_coeffs = uptake_B_zsr(vec, CANDIDATE_SALTS, site)
+        single_coeffs = single_salt_half_swing_coefficients(name, site)
+        assert single_coeffs is not None and zsr_coeffs is not None
+        assert abs(zsr_coeffs.at_high_humidity - single_coeffs.at_high_humidity) < 1e-5 * max(1.0, abs(single_coeffs.at_high_humidity))
+        assert abs(zsr_coeffs.at_low_humidity - single_coeffs.at_low_humidity) < 1e-5 * max(1.0, abs(single_coeffs.at_low_humidity))
 
 
-def test_zsr_pure_salt_lcow_matches_lcow_at_sl() -> None:
+def test_zsr_pure_salt_lcow_matches_single_salt_scalar() -> None:
     site = SiteClimate(0.9, 0.78)
     econ = LCOEconomicParams()
     sl = 2.0
     for name in ("NaCl", "LiCl"):
         vec = np.zeros(len(CANDIDATE_SALTS), dtype=np.float64)
         vec[CANDIDATE_SALTS.index(name)] = 1.0
-        a = lcow_at_sl(name, site, econ, sl)
-        b = lcow_zsr_at_sl(vec, CANDIDATE_SALTS, site, econ, sl)
-        assert abs(a - b) < 1e-4 * max(1.0, abs(a))
+        lcow_single = single_salt_lcow_at_loading(name, site, econ, sl)
+        lcow_zsr = lcow_zsr_at_sl(vec, CANDIDATE_SALTS, site, econ, sl)
+        assert abs(lcow_single - lcow_zsr) < 1e-4 * max(1.0, abs(lcow_single))
 
 
 def test_zsr_isopiestic_sum() -> None:
-    """ZSR: m_i,blend = f_i m_i* => m_i,blend / m_i* = f_i, sum f_i = 1."""
+    """ZSR: m_i_blend = blend_weight_i * m_i_ref, so sum(blend_weights) == 1."""
     site = SiteClimate(0.9, 0.78)
     names = ("NaCl", "LiCl", "CaCl2")
-    f = np.array([0.2, 0.5, 0.3], dtype=np.float64)
-    t_c = site.t_c
-    s = 0.0
-    for i, nm in enumerate(names):
-        m_star = binary_molality_at_rh(nm, site.rh_high, t_c)
-        s += f[i]  # f_i
-    assert abs(s - 1.0) < 1e-9
-    m_star = [binary_molality_at_rh(nm, site.rh_high, t_c) for nm in names]
-    m_blend = f * np.array(m_star)
-    ratios = m_blend / np.array(m_star)
-    assert np.allclose(ratios, f, rtol=0, atol=1e-9)
+    blend_weights = np.array([0.2, 0.5, 0.3], dtype=np.float64)
+    assert abs(float(np.sum(blend_weights)) - 1.0) < 1e-9
+    reference_molalities = [binary_molality_at_rh(nm, site.humidity_high, site.temperature_c) for nm in names]
+    blended_molalities = blend_weights * np.array(reference_molalities)
+    ratios = blended_molalities / np.array(reference_molalities)
+    assert np.allclose(ratios, blend_weights, rtol=0, atol=1e-9)
 
 
 def test_optimize_zsr_runs() -> None:
@@ -98,18 +97,18 @@ def test_optimize_zsr_runs() -> None:
     assert out.backend in ("ipopt", "scipy_slsqp")
 
 
-def test_pyomo_zsr_lcow_matches_scalar_at_fixed_point() -> None:
+def test_pyomo_model_lcow_matches_scalar_at_fixed_point() -> None:
     site = SiteClimate(0.9, 0.78)
     names = ("NaCl", "LiCl")
     econ = LCOEconomicParams()
-    m = build_lcow_zsr_pyomo_model(site, names, econ)
-    assert not m.infeasible
-    m.f[0].set_value(0.5)
-    m.f[1].set_value(0.5)
-    m.SL.set_value(3.0)
-    pyv = pe.value(m.lcow_expr)
-    sc = lcow_zsr_at_sl(np.array([0.5, 0.5]), names, site, econ, 3.0)
-    assert abs(pyv - sc) < 1e-5 * max(1.0, abs(sc))
+    model = build_lcow_model(site, names, econ)
+    assert not model.infeasible
+    model.blend_weight[0].set_value(0.5)
+    model.blend_weight[1].set_value(0.5)
+    model.salt_to_polymer_ratio.set_value(3.0)
+    pyomo_lcow = pe.value(model.lcow_usd_per_kg_water)
+    scalar_lcow = lcow_zsr_at_sl(np.array([0.5, 0.5]), names, site, econ, 3.0)
+    assert abs(pyomo_lcow - scalar_lcow) < 1e-5 * max(1.0, abs(scalar_lcow))
 
 
 @pytest.mark.skipif(
