@@ -23,8 +23,32 @@ def _find_root(
     f: Callable[[float], float],
     x_min: float = _BRACKET_LO,
     x_max: float = _BRACKET_HI,
+    *,
+    robust: bool = False,
+    n_test: int = 20,
 ) -> float:
-    """Find a root of f on (x_min, x_max) using Brent's method; returns nan if no bracket."""
+    """Find a root of f on (x_min, x_max) using Brent's method; returns nan if no bracket.
+
+    With ``robust=True``, scan ``n_test`` points (MATLAB ``robust_fzero`` behavior) and
+    bracket the first sign change. Needed for MgCl2 where the polynomial is non-monotonic
+    on [0.01, 0.75] so endpoint residuals can share the same sign.
+    """
+    if robust:
+        step = (x_max - x_min) / (n_test - 1)
+        x_prev, f_prev = x_min, f(x_min)
+        if not math.isfinite(f_prev):
+            return float("nan")
+        for i in range(1, n_test):
+            x_curr = x_min + i * step
+            f_curr = f(x_curr)
+            if not math.isfinite(f_curr):
+                x_prev, f_prev = x_curr, f_curr
+                continue
+            if f_prev * f_curr < 0:
+                return float(brentq(f, x_prev, x_curr, maxiter=200))
+            x_prev, f_prev = x_curr, f_curr
+        return float("nan")
+
     fa, fb = f(x_min), f(x_max)
     if not (fa * fb < 0) or (math.isnan(fa) or math.isnan(fb)):
         return float("nan")
@@ -104,7 +128,7 @@ def mf_MgCl2(relative_humidity: float) -> float:
             - A_3 * salt_fraction**3 - A_4 * salt_fraction**4
         )
 
-    return _find_root(residual, 0.01, 0.75)
+    return _find_root(residual, 0.01, 0.75, robust=True)
 
 
 _isotherm_by_salt: dict[str, Callable[[float, float], float]] = {

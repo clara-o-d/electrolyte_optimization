@@ -1,10 +1,16 @@
 # Default economic inputs for LCOW (see src/optimization/economics.LCOEconomicParams)
 discount_rate: 0.08
-device_lifetime_years: 10
+device_lifetime_years: 20
 total_investment_factor: 1.0
 maintenance_cost_fraction: 0.05
 utilization_factor: 0.9
 hydrogel_lifetime_years: 1.0
 energy_cost_usd_per_year: 0.0
-c_acrylamide_usd_per_kg: 1.6
-# Optional: per-salt prices are in src/materials/salts.SALT_TABLE
+c_acrylamide_usd_per_kg: 1.1
+# c_additives_usd_per_kg_composite uses economics.py default (APS, MBAA, TEMED)
+
+# Active electrical heating: Q_elec is optimized in [0, max_electric_heat_w_per_m2]
+# (W/m^2) jointly with blend/SL to minimize LCOW. Set to 0 for passive-only mode.
+electricity_price_usd_per_kwh: 0.10
+desorption_hours_per_day: 8.0
+max_electric_heat_w_per_m2: 1500.0

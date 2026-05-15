@@ -55,11 +55,26 @@ class SiteResult:
     lon: float
     rh_high: float
     rh_low: float
+    """Diagnostic mean daily min RH; not used by the new desorption model."""
+    temp_high_c: float
+    """Mean daily max ambient temperature (deg C); used as the condenser/ambient T."""
+    temp_low_c: float
+    """Diagnostic mean daily min ambient temperature (deg C); not used by the model."""
+    solar_irradiance_w_per_m2: float
+    """Mean daily max shortwave irradiance (W/m^2); drives the steady-state gel T."""
+    gel_temperature_c: float
+    """Passive (sun-only) gel temperature from the heat balance at this site (deg C)."""
     best_salt: str
     """Dominant salt (largest blend fraction) so markers stay meaningful."""
     best_sl: float
     best_lcow: float
     infeasible: bool
+    electric_heat_w_per_m2: float = 0.0
+    """Optimizer-selected electrical heat during desorption (W/m²); 0 if passive."""
+    gel_temperature_optimized_c: float = float("nan")
+    """Gel temperature at the LCOW optimum (deg C); equals passive T_gel when Q_elec=0."""
+    annual_electricity_cost_usd_per_m2: float = 0.0
+    """Annual electricity cost at the optimum (USD/yr per m² of gel footprint)."""
     zsr_backend: str = ""
     """``ipopt`` / ``scipy_slsqp``."""
     blend: str = ""
@@ -131,6 +146,18 @@ def sample_land_points(
     return out
 
 
+def _annual_electricity_cost_usd_per_m2(
+    econ: LCOEconomicParams, electric_heat_w_per_m2: float
+) -> float:
+    return (
+        econ.electricity_price_usd_per_kwh
+        * electric_heat_w_per_m2
+        * econ.desorption_hours_per_day
+        * 365.0
+        / 1000.0
+    )
+
+
 def run_sites(
     lats: list[float],
     lons: list[float],
@@ -138,6 +165,7 @@ def run_sites(
     year: int,
     sleep_s: float,
     cache_dir: Path | None,
+    econ: LCOEconomicParams | None = None,
 ) -> list[SiteResult]:
     start = date(year, 1, 1)
     end = date(year, 12, 31)
@@ -146,7 +174,7 @@ def run_sites(
     if cache_dir is not None:
         print(f"  Weather cache: {cache_dir}", flush=True)
     client = WeatherClient(cache_dir=cache_dir)
-    econ = LCOEconomicParams()
+    econ = econ or LCOEconomicParams()
     results: list[SiteResult] = []
     t_batch = time.perf_counter()
     for i, (lat, lon) in enumerate(zip(lats, lons, strict=True), start=1):
@@ -157,15 +185,21 @@ def run_sites(
             lon,
             start,
             end,
-            variables=("relative_humidity_2m",),
+            variables=("relative_humidity_2m", "temperature_2m", "shortwave_radiation"),
         )
         row = site_row_from_hourly(df)
         site = SiteClimate(
             humidity_high=row["rh_high_frac"],
-            humidity_low=row["rh_low_frac"],
+            temperature_c=row["temperature_high_c"],
+            solar_irradiance_w_per_m2=row["solar_irradiance_w_per_m2"],
         )
+        rh_low_diagnostic = float(row["rh_low_frac"])
+        temp_low_diagnostic = float(row["temperature_low_c"])
         print(
-            f"  mean daily max RH={site.humidity_high:.3f}  min RH={site.humidity_low:.3f}  optimizing…",
+            f"  RH max={site.humidity_high:.3f} (min={rh_low_diagnostic:.3f})  "
+            f"T_amb max={site.temperature_c:.1f}C (min={temp_low_diagnostic:.1f}C)  "
+            f"I={site.solar_irradiance_w_per_m2:.0f}W/m^2  "
+            f"T_gel={site.gel_temperature_c:.1f}C  optimizing…",
             end="",
             flush=True,
         )
@@ -191,7 +225,14 @@ def run_sites(
                     lat=lat,
                     lon=lon,
                     rh_high=site.humidity_high,
-                    rh_low=site.humidity_low,
+                    rh_low=rh_low_diagnostic,
+                    temp_high_c=site.temperature_c,
+                    temp_low_c=temp_low_diagnostic,
+                    solar_irradiance_w_per_m2=site.solar_irradiance_w_per_m2,
+                    gel_temperature_c=site.gel_temperature_c,
+                    electric_heat_w_per_m2=0.0,
+                    gel_temperature_optimized_c=float("nan"),
+                    annual_electricity_cost_usd_per_m2=0.0,
                     best_salt="none",
                     best_sl=float("nan"),
                     best_lcow=_FAIL_LCO,
@@ -211,12 +252,24 @@ def run_sites(
             for nm, w in zip(z_out.names, z_out.best_f, strict=True)
             if float(w) >= 1e-4
         )
+        q_elec = float(z_out.best_electric_heat_w_per_m2)
+        t_gel_opt = float(z_out.best_gel_temperature_c)
+        if not math.isfinite(t_gel_opt):
+            t_gel_opt = site.gel_temperature_c
+        annual_elec = _annual_electricity_cost_usd_per_m2(econ, q_elec)
         results.append(
             SiteResult(
                 lat=lat,
                 lon=lon,
                 rh_high=site.humidity_high,
-                rh_low=site.humidity_low,
+                rh_low=rh_low_diagnostic,
+                temp_high_c=site.temperature_c,
+                temp_low_c=temp_low_diagnostic,
+                solar_irradiance_w_per_m2=site.solar_irradiance_w_per_m2,
+                gel_temperature_c=site.gel_temperature_c,
+                electric_heat_w_per_m2=q_elec,
+                gel_temperature_optimized_c=t_gel_opt,
+                annual_electricity_cost_usd_per_m2=annual_elec,
                 best_salt=dom,
                 best_sl=float(z_out.best_sl),
                 best_lcow=float(z_out.best_lcow),
@@ -229,24 +282,65 @@ def run_sites(
             print(f"  → infeasible / placeholder LCOW  ({dt:.1f}s)", flush=True)
         else:
             short = blend if len(blend) <= 56 else blend[:53] + "…"
+            heat_line = (
+                f"  Q_elec={q_elec:.1f} W/m²  T_gel={t_gel_opt:.1f}°C "
+                f"(passive {site.gel_temperature_c:.1f}°C)  "
+                f"elec=${annual_elec:.4f}/yr/m²"
+            )
             print(
                 f"  → ZSR[{z_out.backend}]  dom={dom}  SL={z_out.best_sl:.4f}  "
                 f"LCOW=${z_out.best_lcow:.6f}/kg  [{short}]  ({dt:.1f}s)",
                 flush=True,
             )
+            if econ.max_electric_heat_w_per_m2 > 0.0:
+                print(heat_line, flush=True)
         if sleep_s > 0.0 and i < n:
             time.sleep(sleep_s)
     print(f"  All sites done in {time.perf_counter() - t_batch:.1f}s (avg {((time.perf_counter() - t_batch) / max(n,1)):.1f}s / site, incl. sleep).", flush=True)
     return results
 
 
+def _map_title(
+    year: int,
+    n_sites: int,
+    *,
+    hydrogel_lifetime_months: float | None = None,
+    max_electric_heat_w_per_m2: float = 0.0,
+) -> str:
+    """Main figure title and subtitle for the global LCOW map."""
+    hydrogel_mo = hydrogel_lifetime_months if hydrogel_lifetime_months is not None else 12.0
+    heating = (
+        f"active heating Q_elec≤{max_electric_heat_w_per_m2:.0f} W/m²"
+        if max_electric_heat_w_per_m2 > 0.0
+        else "passive (sun-only) gel heating"
+    )
+    return (
+        "Levelized cost of water — SAWH ZSR salt-blend optimization\n"
+        f"{n_sites} random land sites  ·  ERA5 {year}  ·  "
+        f"hydrogel replacement every {hydrogel_mo:g} mo  ·  {heating}"
+    )
+
+
 def plot_map(
     results: list[SiteResult],
     out_path: Path,
     *,
-    title: str,
+    title: str | None = None,
+    year: int = 2023,
+    n_sites: int | None = None,
+    hydrogel_lifetime_months: float | None = None,
+    max_electric_heat_w_per_m2: float = 0.0,
 ) -> None:
     plt, LogNorm, ccrs, cfeature = _try_import_map_stack()
+    from cartopy.mpl.gridliner import LATITUDE_FORMATTER, LONGITUDE_FORMATTER
+
+    if title is None:
+        title = _map_title(
+            year,
+            n_sites if n_sites is not None else len(results),
+            hydrogel_lifetime_months=hydrogel_lifetime_months,
+            max_electric_heat_w_per_m2=max_electric_heat_w_per_m2,
+        )
     lats = np.array([r.lat for r in results])
     lons = np.array([r.lon for r in results])
     lc = np.array([r.best_lcow for r in results])
@@ -274,7 +368,23 @@ def plot_map(
         cfeature.NaturalEarthFeature("physical", "ocean", "110m", facecolor="0.92", zorder=0),
     )
     ax.coastlines(resolution="110m", color="0.3", linewidth=0.4, zorder=1)
-    ax.gridlines(draw_labels=True, alpha=0.3, dms=True, x_inline=False, y_inline=False)
+    gl = ax.gridlines(
+        crs=ccrs.PlateCarree(),
+        draw_labels=True,
+        linewidth=0.35,
+        color="0.45",
+        alpha=0.45,
+        linestyle="--",
+        dms=False,
+        x_inline=False,
+        y_inline=False,
+    )
+    gl.top_labels = False
+    gl.right_labels = False
+    gl.xformatter = LONGITUDE_FORMATTER
+    gl.yformatter = LATITUDE_FORMATTER
+    gl.xlabel_style = {"size": 10}
+    gl.ylabel_style = {"size": 10}
     sc_last = None
     for salt in sorted(set(salts)):
         idx = np.array(
@@ -307,7 +417,7 @@ def plot_map(
             marker="x",
             transform=ccrs.PlateCarree(),
             zorder=5,
-            label="infeasible or failed",
+            label="Infeasible or failed",
         )
     mappable = sc_last if sc_last is not None else plt.matplotlib.cm.ScalarMappable(
         norm=norm, cmap="viridis"
@@ -319,17 +429,22 @@ def plot_map(
         pad=0.04,
     )
     cbar.set_label(
-        "Best LCOW (USD/kg water) — log scale; marker = dominant salt in blend",
-        fontsize=9,
+        "Levelized cost of water (USD per kg water, log scale)",
+        fontsize=10,
     )
-    ax.set_title(title, fontsize=12)
-    leg_items = [plt.Line2D([0], [0], marker=m, color="k", linestyle="", label=n, ms=7) for n, m in _SALT_MARKERS.items() if n != "none"]
+    ax.set_title(title, fontsize=12, pad=10)
+    leg_items = [
+        plt.Line2D([0], [0], marker=m, color="k", linestyle="", label=n, ms=7)
+        for n, m in _SALT_MARKERS.items()
+        if n != "none"
+    ]
     ax.legend(
         handles=leg_items,
         loc="lower left",
-        title="Marker = dominant salt",
+        title="Dominant salt in optimal blend",
         framealpha=0.9,
         fontsize=8,
+        title_fontsize=9,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -354,6 +469,37 @@ def main() -> int:
         default=_REPO / "outputs" / "lcow_global" / "lcow_random_sites.csv",
     )
     p.add_argument("--cache", type=Path, default=_REPO / ".cache" / "openmeteo")
+    p.add_argument(
+        "--hydrogel-lifetime-months",
+        type=float,
+        default=None,
+        metavar="M",
+        help=(
+            "Hydrogel replacement interval in months (overrides default 12 months). "
+            "Example: --hydrogel-lifetime-months 1 for monthly replacement."
+        ),
+    )
+    p.add_argument(
+        "--max-electric-heat-w-per-m2",
+        type=float,
+        default=None,
+        metavar="Q",
+        help="Upper bound on optimized Q_elec (W/m²). Default from LCOEconomicParams (1500).",
+    )
+    p.add_argument(
+        "--electricity-price-usd-per-kwh",
+        type=float,
+        default=None,
+        metavar="P",
+        help="Electricity price for active-heating LCOW (USD/kWh).",
+    )
+    p.add_argument(
+        "--desorption-hours-per-day",
+        type=float,
+        default=None,
+        metavar="H",
+        help="Desorption duty (hours/day) for annual electricity cost.",
+    )
     args = p.parse_args()
     print("=== lcow_random_global_map.py ===", flush=True)
     print(
@@ -363,6 +509,54 @@ def main() -> int:
     )
     xlsx = salt_price_data_path()
     print(f"  Salt $/kg: {xlsx.name}  (exists={xlsx.is_file()})", flush=True)
+    econ = LCOEconomicParams()
+    if args.hydrogel_lifetime_months is not None and args.hydrogel_lifetime_months <= 0.0:
+        print("--hydrogel-lifetime-months must be positive.", file=sys.stderr)
+        return 1
+    if args.max_electric_heat_w_per_m2 is not None and args.max_electric_heat_w_per_m2 < 0.0:
+        print("--max-electric-heat-w-per-m2 must be >= 0.", file=sys.stderr)
+        return 1
+    hydrogel_years = (
+        args.hydrogel_lifetime_months / 12.0
+        if args.hydrogel_lifetime_months is not None
+        else econ.hydrogel_lifetime_years
+    )
+    max_q = (
+        float(args.max_electric_heat_w_per_m2)
+        if args.max_electric_heat_w_per_m2 is not None
+        else econ.max_electric_heat_w_per_m2
+    )
+    elec_price = (
+        float(args.electricity_price_usd_per_kwh)
+        if args.electricity_price_usd_per_kwh is not None
+        else econ.electricity_price_usd_per_kwh
+    )
+    desorp_hours = (
+        float(args.desorption_hours_per_day)
+        if args.desorption_hours_per_day is not None
+        else econ.desorption_hours_per_day
+    )
+    econ = LCOEconomicParams(
+        discount_rate=econ.discount_rate,
+        device_lifetime_years=econ.device_lifetime_years,
+        total_investment_factor=econ.total_investment_factor,
+        maintenance_cost_fraction=econ.maintenance_cost_fraction,
+        utilization_factor=econ.utilization_factor,
+        hydrogel_lifetime_years=hydrogel_years,
+        energy_cost_usd_per_year=econ.energy_cost_usd_per_year,
+        c_acrylamide_usd_per_kg=econ.c_acrylamide_usd_per_kg,
+        c_additives_usd_per_kg_composite=econ.c_additives_usd_per_kg_composite,
+        electricity_price_usd_per_kwh=elec_price,
+        desorption_hours_per_day=desorp_hours,
+        max_electric_heat_w_per_m2=max_q,
+    )
+    print(
+        f"  Economics: hydrogel_lifetime={econ.hydrogel_lifetime_years * 12.0:.4g} months  "
+        f"Q_elec≤{econ.max_electric_heat_w_per_m2:.0f} W/m²  "
+        f"electricity=${econ.electricity_price_usd_per_kwh:.3f}/kWh  "
+        f"desorption={econ.desorption_hours_per_day:g} h/day",
+        flush=True,
+    )
     print(
         f"  Optimize: ZSR mixture (Pyomo+Ipopt if available, else SciPy); Ipopt={ipopt_available()}",
         flush=True,
@@ -386,6 +580,7 @@ def main() -> int:
         year=args.year,
         sleep_s=args.sleep,
         cache_dir=args.cache,
+        econ=econ,
     )
     feas = [r for r in res if r.infeasible is False]
     n_bad = len(res) - len(feas)
@@ -399,6 +594,15 @@ def main() -> int:
             f"median={float(np.median(np.asarray(lcs))):.6f}",
             flush=True,
         )
+    if econ.max_electric_heat_w_per_m2 > 0.0 and feas:
+        q_vals = [r.electric_heat_w_per_m2 for r in feas if math.isfinite(r.electric_heat_w_per_m2)]
+        if q_vals:
+            print(
+                f"  Optimal Q_elec (W/m²) min={min(q_vals):.1f}  max={max(q_vals):.1f}  "
+                f"median={float(np.median(np.asarray(q_vals))):.1f}  "
+                f"sites with Q_elec>0: {sum(1 for q in q_vals if q > 1.0)}/{len(q_vals)}",
+                flush=True,
+            )
     print(f"  Best salt counts: {dict(salt_wins)}", flush=True)
     df = pd.DataFrame([asdict(r) for r in res])
     args.out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -408,10 +612,10 @@ def main() -> int:
     plot_map(
         res,
         args.out_png,
-        title=(
-            f"SAWH LCOW min ($/kg), ZSR blend, random land sites, {args.year} "
-            f"(mean diurnal RH extrema)"
-        ),
+        year=args.year,
+        n_sites=args.n,
+        hydrogel_lifetime_months=args.hydrogel_lifetime_months,
+        max_electric_heat_w_per_m2=econ.max_electric_heat_w_per_m2,
     )
     print(f"Wrote {args.out_png}", flush=True)
     print(f"Done in {time.perf_counter() - t_main:.1f}s total.", flush=True)

@@ -5,10 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # --- Physical scale (active hydrogel–salt layer, 1 m²) ---
-# Thickness 1 mm, density 2000 kg/m³ => 2.0 kg dry composite per m²
-HYDROGEL_THICKNESS_M: float = 0.001
-HYDROGEL_DENSITY_KG_M3: float = 2000.0
+# Thickness 4 mm, density 1250.2 kg/m³ => 5.0008 kg dry composite per m²
+HYDROGEL_THICKNESS_M: float = 0.004
+HYDROGEL_DENSITY_KG_M3: float = 1250.2
 DRY_COMPOSITE_MASS_KG: float = HYDROGEL_THICKNESS_M * 1.0 * HYDROGEL_DENSITY_KG_M3
+
+# Density of produced water at the condenser (near-ambient liquid water); used to
+# convert kg → L for the daily-yield second objective. 1.0 kg/L is accurate within
+# ~0.3% from 0–40 °C, so a constant is fine at our reporting precision.
+WATER_DENSITY_KG_PER_L: float = 1.0
 
 # --- Passive SAWH device bill of materials, USD per m² footprint (Table S2) ---
 # Aluminum heater 5.42 kg @ 2.1 $/kg, condenser 13.55 @ 2.1, acrylic 0.004 m³ @ 1487.5,
@@ -22,9 +27,9 @@ C_DEVICE_USD: float = (
     + 100.0 * 0.01
 )
 
-# Small composite additives per kg (Table S1): APS, MBAA, TEMED
+# Acrylamide (polymer matrix) $/kg; small composite additives per kg (Table S1): APS, MBAA, TEMED
+_ACRYLAMIDE_USD_PER_KG: float = 1.1
 _ADDITIVE_USD_PER_KG: float = 0.00068 * 0.61 + 0.0024 * 1.0 + 0.00044 * 10.0
-_ACRYLAMIDE_USD_PER_KG: float = 1.6
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +43,7 @@ class LCOEconomicParams:
     """
 
     discount_rate: float = 0.08
-    device_lifetime_years: int = 10
+    device_lifetime_years: int = 20
     total_investment_factor: float = 1.0
     maintenance_cost_fraction: float = 0.05
     utilization_factor: float = 0.9
@@ -46,6 +51,13 @@ class LCOEconomicParams:
     energy_cost_usd_per_year: float = 0.0
     c_acrylamide_usd_per_kg: float = _ACRYLAMIDE_USD_PER_KG
     c_additives_usd_per_kg_composite: float = _ADDITIVE_USD_PER_KG
+    # --- Active electrical heating of the SAWH device (optional) ---
+    # If max_electric_heat_w_per_m2 > 0 the LCOW NLP exposes Q_elec as a
+    # decision variable bounded on [0, max_electric_heat_w_per_m2] (W/m^2 of
+    # gel footprint, active only during the daily desorption window).
+    electricity_price_usd_per_kwh: float = 0.10
+    desorption_hours_per_day: float = 8.0
+    max_electric_heat_w_per_m2: float = 1500.0
 
     def capital_recovery_factor(self) -> float:
         """Annualized fraction of capital cost: i(1+i)^L / ((1+i)^L - 1)."""
